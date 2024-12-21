@@ -2,10 +2,12 @@
 '''
 @File    :   downloader.py
 @Time    :   2021/06/27 10:24:10
-@Author  :   olixu 
+@Author  :   olixu
 @Version :   1.0
 @Contact :   273601727@qq.com
 @WebSite    :   https://blog.oliverxu.cn
+------------
+degui.liu 2024.12.22 修改下载超时和文件名异常的问题
 '''
 
 # here put the import lib
@@ -22,6 +24,7 @@ import requests
 from lxml import etree
 import fitz
 from PyInquirer import style_from_dict, Token, prompt
+from requests.exceptions import Timeout, RequestException
 
 def main():
     """
@@ -43,6 +46,8 @@ def paper_download(papers):
     for paper in papers:
         print(100*'@')
         paper_filename = paper['year'] + '_' + paper['filename'] + '_' + paper['author'] + '_' + paper['mentor'] + '.pdf'
+        # 如果文件名中有特殊字符，移除或替换它们
+        paper_filename = paper_filename.replace(":", "_").replace(" ", "_").replace("/", "_")
         if verify_name(paper_filename):
             print("论文{}已经存在".format(paper_filename))
             continue
@@ -199,63 +204,110 @@ def download_main_info(info_url: str, pages: list):
     print("总共抓取到{}个元数据信息".format(len(papers)))
     return papers
 
-def download_jpg(url: str, jpg_dir: str):
-    """下载论文链接为jpg
+def download_jpg(url: str, jpg_dir: str, timeout=10, retries=3):
+    """下载论文链接为jpg，并添加了超时处理、重试机制和更详细的日志。
         :param url: 阅读全文链接
+        :param timeout: 请求超时时间（秒）
+        :param retries: 每个请求的最大重试次数
     """
-    url = url
     headers = {
-        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36'
     }
     result = requests.Session()
     print("开始获取图片地址")
-    response = result.get(url, headers=headers, allow_redirects=False)
-    url = response.headers['Location']
-    response = result.get(url, headers=headers, allow_redirects=False)
-    url = response.headers['Location']
-    response = result.get(url, headers=headers, allow_redirects=False)
-    url_bix = response.headers['Location'].split('?')[1]
-    url = "http://thesis.lib.sjtu.edu.cn:8443/read/jumpServlet?page=1&" + url_bix
-    response = result.get(url, headers=headers, allow_redirects=False)
-    urls = json.loads(response.content.decode())
-    print("已经获取到图片地址")
-    i = 1
-    while(True):
-        fig_url = "http://thesis.lib.sjtu.edu.cn:8443/read/" + urls['list'][0]['src'].split('_')[0] + "_{0:05d}".format(i) + ".jpg"
-        response = result.get(fig_url, headers=headers).content
-        while len(response) < 2000 and len(response) != 1049:
-            response = result.get(fig_url, headers=headers).content
-        if len(response) == 1049:
-            #print(response)
-            #print("资源无法访问了，网站挂了")
-            break
-        with open('./{}/{}.jpg'.format(jpg_dir, i), 'wb') as f:
-            f.write(response)
-        i = i + 1
-        print("正在采集第{}页".format(i))
+
+    try:
+        # 使用timeout参数来限制每个请求的最大等待时间
+        response = result.get(url, headers=headers, allow_redirects=False, timeout=timeout)
+        url = response.headers['Location']
+        response = result.get(url, headers=headers, allow_redirects=False, timeout=timeout)
+        url = response.headers['Location']
+        response = result.get(url, headers=headers, allow_redirects=False, timeout=timeout)
+        url_bix = response.headers['Location'].split('?')[1]
+        url = "http://thesis.lib.sjtu.edu.cn:8443/read/jumpServlet?page=1&" + url_bix
+        response = result.get(url, headers=headers, allow_redirects=False, timeout=timeout)
+        urls = json.loads(response.content.decode())
+        print("已经获取到图片地址")
+
+        i = 1
+        while True:
+            fig_url = "http://thesis.lib.sjtu.edu.cn:8443/read/" + urls['list'][0]['src'].split('_')[0] + "_{0:05d}".format(i) + ".jpg"
+
+            for attempt in range(retries + 1):  # 尝试重试
+                try:
+                    response = result.get(fig_url, headers=headers, timeout=timeout)
+
+                    if len(response.content) < 2000 and len(response.content) != 1049:
+                        # 如果内容过小，可能是无效的图片文件，重试
+                        print(f"页面 {i} 内容异常小，尝试重试...")
+                        continue
+
+                    if len(response.content) == 1049:
+                        print("资源无法访问了，网站挂了")
+                        break
+
+                    with open('./{}/{}.jpg'.format(jpg_dir, i), 'wb') as f:
+                        f.write(response.content)
+                    print(f"成功采集第{i}页")
+                    i += 1
+                    break  # 成功后退出重试循环
+
+                except Timeout:
+                    print(f"请求页面 {i} 超时，尝试重试 ({attempt + 1}/{retries})...")
+                    if attempt == retries:
+                        print(f"页面 {i} 请求多次超时，跳过此页.")
+                        i += 1
+                    time.sleep(1)  # 等待1秒再重试，减少服务器压力
+                    continue
+
+                except RequestException as e:
+                    print(f"请求页面 {i} 发生错误: {e}")
+                    if attempt == retries:
+                        print(f"页面 {i} 请求多次失败，跳过此页.")
+                        i += 1
+                    time.sleep(1)  # 等待1秒再重试，减少服务器压力
+                    continue
+
+            else:  # 如果所有重试都失败了，退出循环
+                break
+
+    except Timeout:
+        print("初始化请求超时，无法继续下载.")
+    except RequestException as e:
+        print(f"发生错误: {e}")
 
 def merge_pdf(paper_filename, jpg_dir):
-    doc = fitz.open()
-    imgs = []
+    print(f"paper_filename={paper_filename}, jpg_dir={jpg_dir}")
+    doc = fitz.open()  # 创建一个新的空PDF文档
     img_path = './{}/'.format(jpg_dir)
-    if len(os.listdir('./{}/'.format(jpg_dir)))<100:
+
+    if len(os.listdir(img_path)) < 80:  # 检查是否有足够的图片以避免下载错误
         print("文章{}下载错误，跳过".format(paper_filename))
-        shutil.rmtree('./{}'.format(jpg_dir))
+        shutil.rmtree(img_path)  # 清理临时目录
         return
-    for img in os.listdir('./{}/'.format(jpg_dir)):
-        imgs.append(img)
-    imgs.sort(key=lambda x:int(x[:-4]))
-    for img in imgs:
-        img_file = img_path + img
-        imgdoc = fitz.open(img_file)
-        pdfbytes = imgdoc.convertToPDF()
-        pdf_name = str(img[:-4]) + '.pdf'
-        imgpdf = fitz.open(pdf_name, pdfbytes)
-        doc.insertPDF(imgpdf)
+
+    for img in sorted(os.listdir(img_path), key=lambda x: int(x[:-4])):
+        try:
+            img_file = os.path.join(img_path, img)
+            img_rect = fitz.Rect(0, 0, 595, 842)  # A4纸张大小
+            img_doc = fitz.open(img_file)  # 打开图像文件
+            img_width, img_height = img_doc[0].rect.width, img_doc[0].rect.height
+            if img_width < 100 or img_height < 100:  # 如果图像过小，跳过该图像
+                print(f"跳过尺寸异常的图片: {img_file}")
+                continue
+            pdf_bytes = img_doc.convert_to_pdf()  # 将图像转换为PDF格式
+            img_pdf = fitz.open("pdf", pdf_bytes)  # 打开刚刚创建的PDF
+            page = doc.new_page(width=img_rect.width, height=img_rect.height)  # 在PDF中创建新的空白页
+            page.show_pdf_page(page.rect, img_pdf, 0)  # 将图像PDF的第一页显示在新页上
+        except Exception as e:
+            print(f"处理图像时出错: {img_file}, 错误信息: {e}")
+            continue  # 跳过当前图像
+
     filename = './papers/' + paper_filename
-    doc.save(filename)
+    doc.save(filename)  # 保存合并后的PDF文件
     doc.close()
-    shutil.rmtree('./{}'.format(jpg_dir))
+    print(f"合并完成{filename}", filename)
+    shutil.rmtree(img_path)  # 清理临时目录
 
 if __name__=='__main__':
     main()
